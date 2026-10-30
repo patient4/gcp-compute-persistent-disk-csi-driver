@@ -25,6 +25,7 @@ import (
 	"os/exec"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	csipb "github.com/container-storage-interface/spec/lib/go/csi"
@@ -276,11 +277,26 @@ func (i *InstanceInfo) CreateOrGetInstance() error {
 	}
 
 	// If instance exists but settings differ, delete instance
-	curInst, _ := i.cfg.ComputeService.Instances.Get(i.cfg.Project, i.cfg.Zone, newInst.Name).Do()
+	var curInst *compute.Instance
+	_ = retryGCE(func() error {
+		var getErr error
+		curInst, getErr = i.cfg.ComputeService.Instances.Get(i.cfg.Project, i.cfg.Zone, newInst.Name).Do()
+		if isGCEError(getErr, "notFound") {
+			curInst = nil
+			return nil
+		}
+		return getErr
+	})
 	if curInst != nil {
 		if machineTypeMismatch(curInst, newInst) {
 			klog.V(4).Infof("Instance machine type doesn't match the required one. Delete instance.")
-			if _, err := i.cfg.ComputeService.Instances.Delete(i.cfg.Project, i.cfg.Zone, i.cfg.Name).Do(); err != nil {
+			if err := retryGCE(func() error {
+				_, delErr := i.cfg.ComputeService.Instances.Delete(i.cfg.Project, i.cfg.Zone, i.cfg.Name).Do()
+				if isGCEError(delErr, "notFound") {
+					return nil
+				}
+				return delErr
+			}); err != nil {
 				return err
 			}
 
@@ -299,16 +315,8 @@ func (i *InstanceInfo) CreateOrGetInstance() error {
 	}
 
 	if curInst == nil {
-		op, err := i.cfg.ComputeService.Instances.Insert(i.cfg.Project, i.cfg.Zone, newInst).Do()
-		klog.V(4).Infof("Inserted instance %v in project: %v, zone: %v", newInst.Name, i.cfg.Project, i.cfg.Zone)
-		if err != nil {
-			ret := fmt.Sprintf("could not create instance %s: API error: %v", i.cfg.Name, err.Error())
-			if op != nil {
-				ret = fmt.Sprintf("%s. op error: %v", ret, op.Error)
-			}
-			return errors.New(ret)
-		} else if op.Error != nil {
-			return fmt.Errorf("could not create instance %s: %+v", i.cfg.Name, op.Error)
+		if err := i.insertInstance(newInst); err != nil {
+			return err
 		}
 	} else {
 		klog.V(4).Infof("Compute service got instance %v, skipping instance creation", newInst.Name)
@@ -359,6 +367,106 @@ func (i *InstanceInfo) CreateOrGetInstance() error {
 	// Instance reached running state in time, make sure that cloud-init is complete
 	klog.V(2).Infof("Instance %v has been created successfully", i.cfg.Name)
 	return nil
+}
+
+// retryableCreateErrors are the operation error codes for an instance that
+// could not be created for a reason GCE expects to clear, so that creating it
+// again can succeed.
+var retryableCreateErrors = []string{
+	"ZONE_RESOURCE_POOL_EXHAUSTED",
+	"ZONE_RESOURCE_POOL_EXHAUSTED_WITH_DETAILS",
+	"RESOURCE_OPERATION_RATE_EXCEEDED",
+	"RATE_LIMIT_EXCEEDED",
+	"INTERNAL_ERROR",
+}
+
+// insertInstance creates newInst and waits for its create operation to finish.
+//
+// Instances.Insert returns as soon as GCE accepts the request, and the instance
+// can still fail to be created after that, for example when the zone is out of
+// capacity for the machine type. GCE then removes the instance, so without
+// waiting on the operation the only symptom is an instance that is never found,
+// and the reason it failed is lost.
+//
+// A failure GCE expects to clear, such as a stockout, is retried with a new
+// insert. Any other failure is returned with the reason GCE gave.
+func (i *InstanceInfo) insertInstance(newInst *compute.Instance) error {
+	var createErr error
+	backoff := wait.Backoff{Duration: 30 * time.Second, Factor: 2.0, Jitter: 0.2, Steps: 3}
+	err := wait.ExponentialBackoff(backoff, func() (bool, error) {
+		var op *compute.Operation
+		err := retryGCE(func() error {
+			var insErr error
+			op, insErr = i.cfg.ComputeService.Instances.Insert(i.cfg.Project, i.cfg.Zone, newInst).Do()
+			return insErr
+		})
+		if err != nil {
+			// An earlier attempt may have been committed before its response
+			// was lost, in which case the instance is already being created.
+			if isGCEError(err, "alreadyExists") || gce.IsGCEError(err, "alreadyExists") {
+				return true, nil
+			}
+			return false, fmt.Errorf("could not create instance %s: API error: %w", i.cfg.Name, err)
+		}
+		klog.V(4).Infof("Inserted instance %v in project: %v, zone: %v", newInst.Name, i.cfg.Project, i.cfg.Zone)
+
+		op, err = i.waitForZoneOperation(op)
+		if err != nil {
+			return false, fmt.Errorf("could not create instance %s: %w", i.cfg.Name, err)
+		}
+		if op.Error == nil || len(op.Error.Errors) == 0 {
+			return true, nil
+		}
+
+		createErr = fmt.Errorf("could not create instance %s: %s", i.cfg.Name, formatOperationErrors(op.Error))
+		for _, opErr := range op.Error.Errors {
+			if slices.Contains(retryableCreateErrors, opErr.Code) {
+				klog.Warningf("%v, will retry", createErr)
+				return false, nil
+			}
+		}
+		return false, createErr
+	})
+	if wait.Interrupted(err) && createErr != nil {
+		return createErr
+	}
+	return err
+}
+
+// waitForZoneOperation waits for a zonal operation to finish and returns it.
+func (i *InstanceInfo) waitForZoneOperation(op *compute.Operation) (*compute.Operation, error) {
+	if op.Status == "DONE" {
+		return op, nil
+	}
+	start := time.Now()
+	err := wait.PollUntilContextTimeout(context.Background(), 5*time.Second, 5*time.Minute, true, func(_ context.Context) (bool, error) {
+		klog.V(2).Infof("Waiting for operation %s on instance %s. %v elapsed", op.Name, i.cfg.Name, time.Since(start))
+		var getErr error
+		var current *compute.Operation
+		err := retryGCE(func() error {
+			current, getErr = i.cfg.ComputeService.ZoneOperations.Get(i.cfg.Project, i.cfg.Zone, op.Name).Do()
+			return getErr
+		})
+		if err != nil {
+			return false, fmt.Errorf("failed to get operation %s: %w", op.Name, err)
+		}
+		op = current
+		return op.Status == "DONE", nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("operation %s did not finish: %w", op.Name, err)
+	}
+	return op, nil
+}
+
+// formatOperationErrors renders every error an operation reports, so that the
+// code GCE gave, such as ZONE_RESOURCE_POOL_EXHAUSTED, reaches the test log.
+func formatOperationErrors(opErr *compute.OperationError) string {
+	msgs := make([]string, 0, len(opErr.Errors))
+	for _, e := range opErr.Errors {
+		msgs = append(msgs, fmt.Sprintf("%s: %s", e.Code, e.Message))
+	}
+	return strings.Join(msgs, "; ")
 }
 
 func (i *InstanceInfo) DeleteInstance() {
@@ -416,32 +524,50 @@ func getTimestamp() string {
 	return fmt.Sprintf("%s", time.Now().Format(timestampFormat))
 }
 
+var firewallMu sync.Mutex
+
 // Create default SSH filewall rule if it does not exist
 func (i *InstanceInfo) createDefaultFirewallRule() error {
-	var err error
-	klog.V(4).Infof("Creating default firewall rule %s...", defaultFirewallRule)
+	firewallMu.Lock()
+	defer firewallMu.Unlock()
 
-	if _, err = i.cfg.ComputeService.Firewalls.Get(i.cfg.Project, defaultFirewallRule).Do(); err != nil {
-		klog.V(4).Infof("Default firewall rule %v does not exist, creating", defaultFirewallRule)
-		f := &compute.Firewall{
-			Name: defaultFirewallRule,
-			Allowed: []*compute.FirewallAllowed{
-				{
-					IPProtocol: "tcp",
-					Ports:      []string{"22"},
-				},
-			},
+	klog.V(4).Infof("Creating default firewall rule %s...", defaultFirewallRule)
+	var notFound bool
+	err := retryGCE(func() error {
+		_, getErr := i.cfg.ComputeService.Firewalls.Get(i.cfg.Project, defaultFirewallRule).Do()
+		if isGCEError(getErr, "notFound") {
+			notFound = true
+			return nil
 		}
-		_, err = i.cfg.ComputeService.Firewalls.Insert(i.cfg.Project, f).Do()
-		if err != nil {
-			if gce.IsGCEError(err, "alreadyExists") {
-				klog.V(4).Infof("Default firewall rule %v already exists, skipping creation", defaultFirewallRule)
-				return nil
-			}
-			return fmt.Errorf("Failed to insert required default SSH firewall Rule %v: %v", defaultFirewallRule, err.Error())
-		}
-	} else {
+		return getErr
+	})
+	if err != nil {
+		return fmt.Errorf("failed to check default SSH firewall rule %v: %v", defaultFirewallRule, err)
+	}
+	if !notFound {
 		klog.V(4).Infof("Default firewall rule %v already exists, skipping creation", defaultFirewallRule)
+		return nil
+	}
+
+	klog.V(4).Infof("Default firewall rule %v does not exist, creating", defaultFirewallRule)
+	f := &compute.Firewall{
+		Name: defaultFirewallRule,
+		Allowed: []*compute.FirewallAllowed{
+			{
+				IPProtocol: "tcp",
+				Ports:      []string{"22"},
+			},
+		},
+	}
+	err = retryGCE(func() error {
+		_, insErr := i.cfg.ComputeService.Firewalls.Insert(i.cfg.Project, f).Do()
+		if insErr != nil && (gce.IsGCEError(insErr, "alreadyExists") || isGCEError(insErr, "alreadyExists")) {
+			return nil
+		}
+		return insErr
+	})
+	if err != nil {
+		return fmt.Errorf("Failed to insert required default SSH firewall Rule %v: %v", defaultFirewallRule, err.Error())
 	}
 	return nil
 }
@@ -588,4 +714,32 @@ func isGCEError(err error, reason string) bool {
 		}
 	}
 	return false
+}
+
+func isRetryableGCEError(err error) bool {
+	var apiErr *googleapi.Error
+	if !errors.As(err, &apiErr) {
+		return false
+	}
+	return apiErr.Code == http.StatusTooManyRequests || apiErr.Code >= http.StatusInternalServerError
+}
+
+func retryGCE(fn func() error) error {
+	backoff := wait.Backoff{Duration: 2 * time.Second, Factor: 2.0, Jitter: 0.2, Steps: 6}
+	var lastErr error
+	err := wait.ExponentialBackoff(backoff, func() (bool, error) {
+		lastErr = fn()
+		if lastErr == nil {
+			return true, nil
+		}
+		if isRetryableGCEError(lastErr) {
+			klog.Warningf("Transient GCE API error (will retry): %v", lastErr)
+			return false, nil
+		}
+		return false, lastErr
+	})
+	if err != nil && lastErr != nil {
+		return lastErr
+	}
+	return err
 }
