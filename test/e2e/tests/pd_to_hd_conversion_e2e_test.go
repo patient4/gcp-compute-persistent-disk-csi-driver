@@ -51,6 +51,9 @@ var _ = Describe("GCE PD CSI Driver ControllerModifyVolume", func() {
 		if !runCMVTests() {
 			Skip("Not running ControllerModifyVolume tests, as RUN_CONTROLLER_MODIFY_VOLUME_TESTS is falsy")
 		}
+		if len(mwTestContexts) == 0 {
+			Skip("Not running ControllerModifyVolume test, as no multiwriter test contexts are configured")
+		}
 
 		testContext := getRandomMwTestContext()
 		client := testContext.Client
