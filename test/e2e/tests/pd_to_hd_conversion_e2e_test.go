@@ -16,8 +16,9 @@ package tests
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"strings"
-	"testing"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/uuid"
@@ -190,115 +191,107 @@ var _ = Describe("GCE PD CSI Driver ControllerModifyVolume", func() {
 	})
 })
 
-func TestDiskConversionE2E(t *testing.T) {
-	ctx, env, restoreDriver := testutils.SetupDiskConversionE2E(t)
-	t.Cleanup(func() {
+func requireConversionSuccess(err error, message string) {
+	if err != nil {
+		GinkgoT().Fatalf("%s: %v", message, err)
+	}
+}
+
+var _ = Describe("PD to Hyperdisk disk type conversion", Ordered, func() {
+	var (
+		ctx           context.Context
+		cancel        context.CancelFunc
+		env           *testutils.DiskConversionEnvironment
+		restoreDriver func(context.Context) error
+	)
+
+	BeforeAll(func() {
+		if os.Getenv("RUN_PD_TO_HD_CONVERSION_E2E") != "true" {
+			Skip("set RUN_PD_TO_HD_CONVERSION_E2E=true to run against an existing Kubernetes cluster")
+		}
+		ctx, cancel, env, restoreDriver = testutils.SetupDiskConversionE2E(GinkgoT())
+	})
+
+	AfterAll(func() {
+		if cancel != nil {
+			cancel()
+		}
+		if restoreDriver == nil {
+			return
+		}
 		restoreCtx, cancel := context.WithTimeout(context.Background(), 20*time.Minute)
 		defer cancel()
-		if err := restoreDriver(restoreCtx); err != nil {
-			t.Errorf("restore controller deployment: %v", err)
-		}
+		Expect(restoreDriver(restoreCtx)).To(Succeed(), "restore controller deployment")
 	})
 
-	t.Run("convert detached disk", func(t *testing.T) {
-		fixture := testutils.NewDiskConversionFixture(t, env)
-		fixture.RequestConversion(t, ctx, 3000, 150)
-		if err := fixture.WaitForDiskType(ctx, "hyperdisk-balanced", 2*time.Hour); err != nil {
-			t.Fatal(err)
-		}
-		if err := fixture.WaitForConversionComplete(ctx, "hyperdisk-balanced", 10*time.Minute); err != nil {
-			t.Fatal(err)
-		}
+	It("converts a detached disk", func() {
+		fixture := testutils.NewDiskConversionFixture(GinkgoT(), env)
+		fixture.RequestConversion(GinkgoT(), ctx, 3000, 150)
+		requireConversionSuccess(fixture.WaitForDiskType(ctx, "hyperdisk-balanced", 2*time.Hour), "wait for disk conversion")
+		requireConversionSuccess(fixture.WaitForConversionComplete(ctx, "hyperdisk-balanced", 10*time.Minute), "wait for conversion completion")
 	})
 
-	t.Run("queue conversion until workload detaches", func(t *testing.T) {
-		fixture := testutils.NewDiskConversionFixture(t, env)
-		fixture.StartPod(t, ctx)
-		fixture.RequestConversion(t, ctx, 3000, 150)
-		if err := fixture.WaitForPVAnnotation(ctx, "pdcsi.gke.io/disk-type-conversion-operation", "Pending", 10*time.Minute); err != nil {
-			t.Fatalf("conversion was not queued while the disk was attached: %v", err)
-		}
-		fixture.StopPod(t, ctx)
-		if err := fixture.WaitForDiskType(ctx, "hyperdisk-balanced", 2*time.Hour); err != nil {
-			t.Fatal(err)
-		}
-		if err := fixture.WaitForConversionComplete(ctx, "hyperdisk-balanced", 10*time.Minute); err != nil {
-			t.Fatal(err)
-		}
+	It("queues conversion until the workload detaches", func() {
+		fixture := testutils.NewDiskConversionFixture(GinkgoT(), env)
+		fixture.StartPod(GinkgoT(), ctx)
+		fixture.RequestConversion(GinkgoT(), ctx, 3000, 150)
+		requireConversionSuccess(fixture.WaitForPVAnnotation(ctx, "pdcsi.gke.io/disk-type-conversion-operation", "Pending", 10*time.Minute),
+			"conversion should be queued while the disk is attached")
+		fixture.StopPod(GinkgoT(), ctx)
+		requireConversionSuccess(fixture.WaitForDiskType(ctx, "hyperdisk-balanced", 2*time.Hour), "wait for disk conversion")
+		requireConversionSuccess(fixture.WaitForConversionComplete(ctx, "hyperdisk-balanced", 10*time.Minute), "wait for conversion completion")
 	})
 
-	t.Run("block attachment during conversion", func(t *testing.T) {
-		fixture := testutils.NewDiskConversionFixture(t, env)
-		fixture.RequestConversion(t, ctx, 3000, 150)
+	It("blocks attachment during conversion", func() {
+		fixture := testutils.NewDiskConversionFixture(GinkgoT(), env)
+		fixture.RequestConversion(GinkgoT(), ctx, 3000, 150)
 		operation, err := fixture.WaitForActiveOperation(ctx, 10*time.Minute)
 		if err != nil {
-			t.Fatal(err)
+			GinkgoT().Fatalf("wait for active conversion operation: %v", err)
 		}
-		fixture.CreatePod(t, ctx)
-		if err := fixture.WaitForPodBlocked(ctx, operation, 2*time.Minute); err != nil {
-			t.Fatal(err)
-		}
-		if err := fixture.WaitForPodAndDisk(ctx, "hyperdisk-balanced", 2*time.Hour); err != nil {
-			t.Fatalf("disk did not become attachable after conversion operation %s: %v", operation, err)
-		}
-		if err := fixture.WaitForConversionComplete(ctx, "hyperdisk-balanced", 10*time.Minute); err != nil {
-			t.Fatal(err)
-		}
+		fixture.CreatePod(GinkgoT(), ctx)
+		requireConversionSuccess(fixture.WaitForPodBlocked(ctx, operation, 2*time.Minute), "wait for attachment to be blocked")
+		requireConversionSuccess(fixture.WaitForPodAndDisk(ctx, "hyperdisk-balanced", 2*time.Hour),
+			fmt.Sprintf("disk should become attachable after conversion operation %s", operation))
+		requireConversionSuccess(fixture.WaitForConversionComplete(ctx, "hyperdisk-balanced", 10*time.Minute), "wait for conversion completion")
 	})
 
-	t.Run("resume conversion after controller restart", func(t *testing.T) {
-		fixture := testutils.NewDiskConversionFixture(t, env)
-		fixture.RequestConversion(t, ctx, 3000, 150)
+	It("resumes conversion after controller restart", func() {
+		fixture := testutils.NewDiskConversionFixture(GinkgoT(), env)
+		fixture.RequestConversion(GinkgoT(), ctx, 3000, 150)
 		operation, err := fixture.WaitForActiveOperation(ctx, 10*time.Minute)
 		if err != nil {
-			t.Fatal(err)
+			GinkgoT().Fatalf("wait for active conversion operation: %v", err)
 		}
-		if err := testutils.RestartDiskConversionController(ctx, env); err != nil {
-			t.Fatalf("restart controller while conversion %s is active: %v", operation, err)
-		}
-		if err := fixture.VerifyConversionIntent(ctx, operation); err != nil {
-			t.Fatal(err)
-		}
-		if err := fixture.WaitForDiskType(ctx, "hyperdisk-balanced", 2*time.Hour); err != nil {
-			t.Fatal(err)
-		}
-		if err := fixture.WaitForConversionComplete(ctx, "hyperdisk-balanced", 10*time.Minute); err != nil {
-			t.Fatal(err)
-		}
+		requireConversionSuccess(testutils.RestartDiskConversionController(ctx, env),
+			fmt.Sprintf("restart controller while conversion %s is active", operation))
+		requireConversionSuccess(fixture.VerifyConversionIntent(ctx, operation), "verify conversion intent after controller restart")
+		requireConversionSuccess(fixture.WaitForDiskType(ctx, "hyperdisk-balanced", 2*time.Hour), "wait for disk conversion")
+		requireConversionSuccess(fixture.WaitForConversionComplete(ctx, "hyperdisk-balanced", 10*time.Minute), "wait for conversion completion")
 	})
 
-	t.Run("retry conversion after instant snapshot is removed", func(t *testing.T) {
-		fixture := testutils.NewDiskConversionFixture(t, env)
-		if err := fixture.CreateInstantSnapshot(ctx); err != nil {
-			t.Fatalf("create instant snapshot: %v", err)
-		}
-		fixture.RequestConversion(t, ctx, 3000, 150)
-		if err := fixture.WaitForSnapshotRetry(ctx, 15*time.Minute); err != nil {
-			t.Fatalf("conversion did not report a retriable snapshot conflict: %v", err)
-		}
-		fixture.DeleteInstantSnapshot(t, ctx)
-		if err := fixture.WaitForDiskType(ctx, "hyperdisk-balanced", 2*time.Hour); err != nil {
-			t.Fatal(err)
-		}
-		if err := fixture.WaitForConversionComplete(ctx, "hyperdisk-balanced", 10*time.Minute); err != nil {
-			t.Fatal(err)
-		}
+	It("retries conversion after an instant snapshot is removed", func() {
+		fixture := testutils.NewDiskConversionFixture(GinkgoT(), env)
+		requireConversionSuccess(fixture.CreateInstantSnapshot(ctx), "create instant snapshot")
+		fixture.RequestConversion(GinkgoT(), ctx, 3000, 150)
+		requireConversionSuccess(fixture.WaitForSnapshotRetry(ctx, 15*time.Minute),
+			"conversion should report a retriable snapshot conflict")
+		fixture.DeleteInstantSnapshot(GinkgoT(), ctx)
+		requireConversionSuccess(fixture.WaitForDiskType(ctx, "hyperdisk-balanced", 2*time.Hour), "wait for disk conversion")
+		requireConversionSuccess(fixture.WaitForConversionComplete(ctx, "hyperdisk-balanced", 10*time.Minute), "wait for conversion completion")
 	})
 
-	t.Run("cancel queued conversion when VAC is cleared", func(t *testing.T) {
-		fixture := testutils.NewDiskConversionFixture(t, env)
-		fixture.StartPod(t, ctx)
-		fixture.RequestConversion(t, ctx, 3000, 150)
-		if err := fixture.WaitForPVAnnotation(ctx, "pdcsi.gke.io/disk-type-conversion-operation", "Pending", 10*time.Minute); err != nil {
-			t.Fatalf("conversion was not queued while the disk was attached: %v", err)
-		}
-		fixture.ClearVolumeAttributesClass(t, ctx)
-		if err := fixture.WaitForConversionCancelled(ctx, 5*time.Minute); err != nil {
-			t.Fatalf("pending conversion was not cancelled after clearing the PVC VAC: %v", err)
-		}
-		fixture.StopPod(t, ctx)
-		if err := fixture.WaitForDiskType(ctx, "pd-balanced", 2*time.Minute); err != nil {
-			t.Fatalf("disk type changed after the queued conversion was cancelled: %v", err)
-		}
+	It("cancels a queued conversion when the VAC is cleared", func() {
+		fixture := testutils.NewDiskConversionFixture(GinkgoT(), env)
+		fixture.StartPod(GinkgoT(), ctx)
+		fixture.RequestConversion(GinkgoT(), ctx, 3000, 150)
+		requireConversionSuccess(fixture.WaitForPVAnnotation(ctx, "pdcsi.gke.io/disk-type-conversion-operation", "Pending", 10*time.Minute),
+			"conversion should be queued while the disk is attached")
+		fixture.ClearVolumeAttributesClass(GinkgoT(), ctx)
+		requireConversionSuccess(fixture.WaitForConversionCancelled(ctx, 5*time.Minute),
+			"pending conversion should be cancelled after clearing the PVC VAC")
+		fixture.StopPod(GinkgoT(), ctx)
+		requireConversionSuccess(fixture.WaitForDiskType(ctx, "pd-balanced", 2*time.Minute),
+			"disk type should remain unchanged after the queued conversion is cancelled")
 	})
-}
+})

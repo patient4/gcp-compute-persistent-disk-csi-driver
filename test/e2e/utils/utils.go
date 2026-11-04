@@ -24,7 +24,6 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
-	"testing"
 	"time"
 
 	"golang.org/x/oauth2/google"
@@ -451,6 +450,14 @@ const (
 	driverContainerName         = "gce-pd-driver"
 )
 
+type DiskConversionTestT interface {
+	Cleanup(func())
+	Errorf(format string, args ...any)
+	Fatal(args ...any)
+	Fatalf(format string, args ...any)
+	Helper()
+}
+
 type DiskConversionEnvironment struct {
 	client         *kubernetes.Clientset
 	compute        *compute.Service
@@ -474,7 +481,7 @@ type DiskConversionFixture struct {
 	snapshotOp   string
 }
 
-func SetupDiskConversionE2E(t *testing.T) (context.Context, *DiskConversionEnvironment, func(context.Context) error) {
+func SetupDiskConversionE2E(t DiskConversionTestT) (context.Context, context.CancelFunc, *DiskConversionEnvironment, func(context.Context) error) {
 	t.Helper()
 	kubeconfig := os.Getenv("KUBECONFIG")
 	if kubeconfig == "" {
@@ -497,7 +504,12 @@ func SetupDiskConversionE2E(t *testing.T) (context.Context, *DiskConversionEnvir
 		t.Fatalf("create Kubernetes client: %v", err)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 12*time.Hour)
-	t.Cleanup(cancel)
+	setupComplete := false
+	defer func() {
+		if !setupComplete {
+			cancel()
+		}
+	}()
 	computeClient, err := compute.NewService(ctx, option.WithScopes(compute.CloudPlatformScope))
 	if err != nil {
 		t.Fatalf("create Compute Engine client: %v", err)
@@ -525,10 +537,11 @@ func SetupDiskConversionE2E(t *testing.T) (context.Context, *DiskConversionEnvir
 	if err != nil {
 		t.Fatalf("enable disk conversion on controller deployment %s/%s: %v", namespace, deploymentName, err)
 	}
-	return ctx, env, restore
+	setupComplete = true
+	return ctx, cancel, env, restore
 }
 
-func NewDiskConversionFixture(t *testing.T, env *DiskConversionEnvironment) *DiskConversionFixture {
+func NewDiskConversionFixture(t DiskConversionTestT, env *DiskConversionEnvironment) *DiskConversionFixture {
 	t.Helper()
 	name := "pdconv-" + strings.ReplaceAll(strings.ToLower(string(uuid.NewUUID())), "-", "")[:12]
 	fixture := &DiskConversionFixture{
@@ -562,7 +575,7 @@ func NewDiskConversionFixture(t *testing.T, env *DiskConversionEnvironment) *Dis
 	return fixture
 }
 
-func (f *DiskConversionFixture) createStaticPVAndPVC(t *testing.T) {
+func (f *DiskConversionFixture) createStaticPVAndPVC(t DiskConversionTestT) {
 	t.Helper()
 	ctx := context.Background()
 	className := ""
@@ -621,7 +634,7 @@ func (f *DiskConversionFixture) createStaticPVAndPVC(t *testing.T) {
 	}
 }
 
-func (f *DiskConversionFixture) RequestConversion(t *testing.T, ctx context.Context, iops, throughput int64) {
+func (f *DiskConversionFixture) RequestConversion(t DiskConversionTestT, ctx context.Context, iops, throughput int64) {
 	t.Helper()
 	vacName := f.name + "-vac"
 	vac := &storagev1beta1.VolumeAttributesClass{
@@ -644,7 +657,7 @@ func (f *DiskConversionFixture) RequestConversion(t *testing.T, ctx context.Cont
 	}
 }
 
-func (f *DiskConversionFixture) ClearVolumeAttributesClass(t *testing.T, ctx context.Context) {
+func (f *DiskConversionFixture) ClearVolumeAttributesClass(t DiskConversionTestT, ctx context.Context) {
 	t.Helper()
 	if err := updatePVC(ctx, f.env, f.namespace, f.claimName, func(pvc *corev1.PersistentVolumeClaim) {
 		pvc.Spec.VolumeAttributesClassName = nil
@@ -653,7 +666,7 @@ func (f *DiskConversionFixture) ClearVolumeAttributesClass(t *testing.T, ctx con
 	}
 }
 
-func (f *DiskConversionFixture) StartPod(t *testing.T, ctx context.Context) {
+func (f *DiskConversionFixture) StartPod(t DiskConversionTestT, ctx context.Context) {
 	t.Helper()
 	f.CreatePod(t, ctx)
 	if err := f.waitForPodRunning(ctx, 15*time.Minute); err != nil {
@@ -661,7 +674,7 @@ func (f *DiskConversionFixture) StartPod(t *testing.T, ctx context.Context) {
 	}
 }
 
-func (f *DiskConversionFixture) CreatePod(t *testing.T, ctx context.Context) {
+func (f *DiskConversionFixture) CreatePod(t DiskConversionTestT, ctx context.Context) {
 	t.Helper()
 	pod := &corev1.Pod{
 		ObjectMeta: metav1.ObjectMeta{Namespace: f.namespace, Name: f.podName},
@@ -687,7 +700,7 @@ func (f *DiskConversionFixture) CreatePod(t *testing.T, ctx context.Context) {
 	}
 }
 
-func (f *DiskConversionFixture) StopPod(t *testing.T, ctx context.Context) {
+func (f *DiskConversionFixture) StopPod(t DiskConversionTestT, ctx context.Context) {
 	t.Helper()
 	err := f.env.client.CoreV1().Pods(f.namespace).Delete(ctx, f.podName, metav1.DeleteOptions{})
 	if err != nil && !apiNotFound(err) {
@@ -927,7 +940,7 @@ func (f *DiskConversionFixture) CreateInstantSnapshot(ctx context.Context) error
 		return err
 	}
 	f.snapshotOp = op.Name
-	return nil
+	return f.waitForSnapshotCreation(ctx)
 }
 
 func (f *DiskConversionFixture) waitForSnapshotCreation(ctx context.Context) error {
@@ -937,7 +950,7 @@ func (f *DiskConversionFixture) waitForSnapshotCreation(ctx context.Context) err
 	return waitZoneOperation(ctx, f.env.compute, f.env.project, f.env.zone, f.snapshotOp, 15*time.Minute)
 }
 
-func (f *DiskConversionFixture) DeleteInstantSnapshot(t *testing.T, ctx context.Context) {
+func (f *DiskConversionFixture) DeleteInstantSnapshot(t DiskConversionTestT, ctx context.Context) {
 	t.Helper()
 	if f.snapshotName == "" {
 		return
@@ -968,7 +981,7 @@ func (f *DiskConversionFixture) waitForDiskDetached(ctx context.Context, timeout
 	})
 }
 
-func (f *DiskConversionFixture) cleanup(t *testing.T) {
+func (f *DiskConversionFixture) cleanup(t DiskConversionTestT) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Hour)
 	defer cancel()

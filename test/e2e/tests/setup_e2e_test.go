@@ -20,6 +20,7 @@ import (
 	"flag"
 	"fmt"
 	"math/rand"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -90,6 +91,10 @@ func TestE2E(t *testing.T) {
 }
 
 var _ = BeforeSuite(func() {
+	if os.Getenv("RUN_PD_TO_HD_CONVERSION_E2E") == "true" {
+		return
+	}
+
 	var err error
 	numberOfInstancesPerZone := *instancesPerZone
 	if numberOfInstancesPerZone < 3 {
