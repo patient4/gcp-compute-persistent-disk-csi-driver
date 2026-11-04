@@ -18,9 +18,10 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"k8s.io/apimachinery/pkg/util/uuid"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/klog/v2"
@@ -121,17 +122,14 @@ var _ = Describe("GCE PD CSI Driver ControllerModifyVolume", func() {
 		testCases := []struct {
 			name       string
 			parameters map[string]string
-			errorText  string
 		}{
 			{
 				name:       "IOPS above the supported maximum",
 				parameters: map[string]string{"type": hdbDiskType, "iops": "100001"},
-				errorText:  "provisioned IOPS exceeds the maximum",
 			},
 			{
 				name:       "throughput above the supported maximum",
 				parameters: map[string]string{"type": hdbDiskType, "throughput": "100001Mi"},
-				errorText:  "provisioned throughput exceeds the maximum",
 			},
 		}
 
@@ -176,7 +174,8 @@ var _ = Describe("GCE PD CSI Driver ControllerModifyVolume", func() {
 				if err == nil {
 					return
 				}
-				Expect(strings.ToLower(err.Error())).To(ContainSubstring(testCase.errorText))
+				Expect(status.Code(err)).To(Equal(codes.InvalidArgument),
+					"Expected InvalidArgument for out-of-range parameters, got: %v", err)
 
 				disk, err = computeService.Disks.Get(project, zone, volName).Do()
 				Expect(err).To(BeNil(), "Could not get disk after rejected modification: %v", err)
