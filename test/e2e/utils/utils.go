@@ -31,7 +31,7 @@ import (
 	compute "google.golang.org/api/compute/v1"
 	"google.golang.org/api/option"
 	corev1 "k8s.io/api/core/v1"
-	storagev1beta1 "k8s.io/api/storage/v1beta1"
+	storagev1 "k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/uuid"
@@ -637,7 +637,7 @@ func (f *DiskConversionFixture) createStaticPVAndPVC(t DiskConversionTestT) {
 func (f *DiskConversionFixture) RequestConversion(t DiskConversionTestT, ctx context.Context, iops, throughput int64) {
 	t.Helper()
 	vacName := f.name + "-vac"
-	vac := &storagev1beta1.VolumeAttributesClass{
+	vac := &storagev1.VolumeAttributesClass{
 		ObjectMeta: metav1.ObjectMeta{Name: vacName},
 		DriverName: driverName,
 		Parameters: map[string]string{
@@ -646,7 +646,7 @@ func (f *DiskConversionFixture) RequestConversion(t DiskConversionTestT, ctx con
 			"throughput": fmt.Sprintf("%dMi", throughput),
 		},
 	}
-	if _, err := f.env.client.StorageV1beta1().VolumeAttributesClasses().Create(ctx, vac, metav1.CreateOptions{}); err != nil {
+	if _, err := f.env.client.StorageV1().VolumeAttributesClasses().Create(ctx, vac, metav1.CreateOptions{}); err != nil {
 		t.Fatalf("create VAC %s: %v", vacName, err)
 	}
 	f.vacNames = append(f.vacNames, vacName)
@@ -1050,7 +1050,7 @@ func (f *DiskConversionFixture) cleanup(t DiskConversionTestT) {
 		t.Errorf("wait for PV %s deletion during cleanup: %v", f.pvName, err)
 	}
 	for _, name := range f.vacNames {
-		if err := f.env.client.StorageV1beta1().VolumeAttributesClasses().Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apiNotFound(err) {
+		if err := f.env.client.StorageV1().VolumeAttributesClasses().Delete(ctx, name, metav1.DeleteOptions{}); err != nil && !apiNotFound(err) {
 			t.Errorf("cleanup VAC %s: %v", name, err)
 		}
 	}
